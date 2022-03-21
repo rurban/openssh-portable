@@ -74,6 +74,10 @@
 # include <util.h>
 #endif
 
+#ifdef __CYGWIN__
+# include <sys/cygwin.h>
+#endif
+
 #include "xmalloc.h"
 #include "ssh.h"
 #include "ssh2.h"
@@ -2186,18 +2190,19 @@ static void
 usage(void)
 {
 	fprintf(stderr,
-	    "usage: ssh-agent [-c | -s] [-Dd] [-a bind_address] [-E fingerprint_hash]\n"
+	    "usage: ssh-agent [-c | -s| -w] [-Dd] [-a bind_address] [-E fingerprint_hash]\n"
 	    "                 [-O option] [-P allowed_providers] [-t life]\n"
 	    "       ssh-agent [-a bind_address] [-E fingerprint_hash] [-O option]\n"
 	    "                 [-P allowed_providers] [-t life] command [arg ...]\n"
-	    "       ssh-agent [-c | -s] -k\n");
+	    "       ssh-agent [-c | -s| -w] -k\n");
 	exit(1);
 }
 
 int
 main(int ac, char **av)
 {
-	int c_flag = 0, d_flag = 0, D_flag = 0, k_flag = 0, s_flag = 0;
+	int c_flag = 0, d_flag = 0, D_flag = 0, k_flag = 0, s_flag = 0,
+	    w_flag = 0;
 	int sock, ch, result, saved_errno;
 	char *shell, *format, *pidstr, *agentsocket = NULL;
 #ifdef HAVE_SETRLIMIT
@@ -2213,6 +2218,11 @@ main(int ac, char **av)
 	struct pollfd *pfd = NULL;
 	size_t npfd = 0;
 	u_int maxfds;
+#if defined(_WIN32) || defined(__CYGWIN__)
+	const char opts[] = "cDdkswE:a:O:P:t:";
+#else
+	const char opts[] = "cDdksE:a:O:P:t:";
+#endif
 
 	/* Ensure that fds 0, 1 and 2 are open or directed to /dev/null */
 	sanitise_stdfd();
@@ -2231,7 +2241,7 @@ main(int ac, char **av)
 	__progname = ssh_get_progname(av[0]);
 	seed_rng();
 
-	while ((ch = getopt(ac, av, "cDdksE:a:O:P:t:")) != -1) {
+	while ((ch = getopt(ac, av, opts)) != -1) {
 		switch (ch) {
 		case 'E':
 			fingerprint_hash = ssh_digest_alg_by_name(optarg);
@@ -2239,7 +2249,7 @@ main(int ac, char **av)
 				fatal("Invalid hash algorithm \"%s\"", optarg);
 			break;
 		case 'c':
-			if (s_flag)
+			if (s_flag || w_flag)
 				usage();
 			c_flag++;
 			break;
@@ -2260,7 +2270,7 @@ main(int ac, char **av)
 			allowed_providers = xstrdup(optarg);
 			break;
 		case 's':
-			if (c_flag)
+			if (c_flag || w_flag)
 				usage();
 			s_flag++;
 			break;
@@ -2283,6 +2293,13 @@ main(int ac, char **av)
 				usage();
 			}
 			break;
+#if defined(_WIN32) || defined(__CYGWIN__)
+		case 'w':
+			if (c_flag || s_flag)
+				usage();
+			w_flag++;
+			break;
+#endif
 		default:
 			usage();
 		}
@@ -2322,7 +2339,8 @@ main(int ac, char **av)
 			perror("kill");
 			exit(1);
 		}
-		format = c_flag ? "unsetenv %s;\n" : "unset %s;\n";
+		format = c_flag ? "unsetenv %s;\n" :
+			w_flag ? "set %s=\n" : "unset %s;\n";
 		printf(format, SSH_AUTHSOCKET_ENV_NAME);
 		printf(format, SSH_AGENTPID_ENV_NAME);
 		printf("echo Agent pid %ld killed;\n", (long)pid);
@@ -2378,9 +2396,41 @@ main(int ac, char **av)
 		log_init(__progname,
 		    d_flag ? SYSLOG_LEVEL_DEBUG3 : SYSLOG_LEVEL_INFO,
 		    SYSLOG_FACILITY_AUTH, 1);
-		format = c_flag ? "setenv %s %s;\n" : "%s=%s; export %s;\n";
-		printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
-		    SSH_AUTHSOCKET_ENV_NAME);
+		format = c_flag ? "setenv %s %s;\n"
+		    : w_flag ? "set %s=%s\n" : "%s=%s; export %s;\n";
+#if defined(_WIN32) || defined(__CYGWIN__)
+		if (w_flag) { // convert cygwin/mingw socket to windows path
+#if defined(__CYGWIN__) || defined(__MINGW__)
+                  const int len = strlen(socket_name);
+                  char *win_path = (char *)malloc(len + 260 + 1001);
+                  err = cygwin_conv_path(CCP_POSIX_TO_WIN_A, socket_name,
+                                         win_path, len + 260 + 1001);
+                  if (err == ENOSPC) {
+                    int newlen = cygwin_conv_path(CCP_POSIX_TO_WIN_A,
+                                                  socket_name, win_path, 0);
+                    win_path = (char *)realloc(&win_path, newlen);
+                    err = cygwin_conv_path(CCP_POSIX_TO_WIN_A, socket_name,
+                                           win_path, newlen);
+                  }
+                  printf(format, SSH_AUTHSOCKET_ENV_NAME, win_path);
+#else
+                  // socket_name: /tmp/ssh-XXX/agent.PID
+                  if (memcmp(socket_name, "/tmp/", 5) == 0) {
+                    char win_path[261];
+                    GetTempPathA(261, win_path);
+                    printf("set %s=%s%s\n", SSH_AUTHSOCKET_ENV_NAME, win_path,
+                           &socket_name[5]);
+                  } else
+                    printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name);
+#endif
+		}
+		else
+#endif
+		if (c_flag)
+		    printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name);
+		else
+		    printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
+			   SSH_AUTHSOCKET_ENV_NAME);
 		printf("echo Agent pid %ld;\n", (long)parent_pid);
 		fflush(stdout);
 		goto skip;
@@ -2394,13 +2444,15 @@ main(int ac, char **av)
 		close(sock);
 		snprintf(pidstrbuf, sizeof pidstrbuf, "%ld", (long)pid);
 		if (ac == 0) {
-			format = c_flag ? "setenv %s %s;\n" : "%s=%s; export %s;\n";
-			printf(format, SSH_AUTHSOCKET_ENV_NAME, socket_name,
-			    SSH_AUTHSOCKET_ENV_NAME);
+		    format = c_flag ? "setenv %s %s;\n" :
+			w_flag ? "set %s=%s\n" : "%s=%s; export %s;\n";
+		    if (w_flag || c_flag)
+			printf(format, SSH_AUTHSOCKET_ENV_NAME, pidstrbuf);
+		    else
 			printf(format, SSH_AGENTPID_ENV_NAME, pidstrbuf,
-			    SSH_AGENTPID_ENV_NAME);
-			printf("echo Agent pid %ld;\n", (long)pid);
-			exit(0);
+			       SSH_AGENTPID_ENV_NAME);
+		    printf("echo Agent pid %ld;\n", (long)pid);
+		    exit(0);
 		}
 		if (setenv(SSH_AUTHSOCKET_ENV_NAME, socket_name, 1) == -1 ||
 		    setenv(SSH_AGENTPID_ENV_NAME, pidstrbuf, 1) == -1) {
